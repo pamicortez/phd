@@ -2,93 +2,148 @@ include("functions.jl")
 include("input.jl")
 include("data.jl")
 include("constructive.jl")
+include("greactive.jl")
+include("hc.jl")
+include("petal.jl")
 include("ps.jl")
-include("psbound.jl")
-include("lineq.jl")
 include("debug.jl")
 
-hcrent, hcfuel, hcfo, hceqsum, hceqmean, hceqmax, hcelapsedtime = Array{Float64}(undef, 6), Array{Float64}(undef, 6), Array{Float64}(undef, 6), Array{Float64}(undef, 6), Array{Float64}(undef, 6), Array{Float64}(undef, 6), Array{Float64}(undef, 6)
-psrent, psfuel, psfo, pseqsum, pseqmean, pseqmax, pselapsedtime = Array{Float64}(undef, 6), Array{Float64}(undef, 6), Array{Float64}(undef, 6), Array{Float64}(undef, 6), Array{Float64}(undef, 6), Array{Float64}(undef, 6), Array{Float64}(undef, 6)
-linfo, lineqsum, withinBound = Array{Float64}(undef, 6), Array{Float64}(undef, 6), Array{Bool}(undef, 6)
-nK2 = Array{Integer}(undef, 6)
+function runCplex()
+    m = createModel(EXACT)
+    setObjective(m)
+
+    routesch, incumbentch, unsatisfiedpenalty, transportationcosts, eqpenalty, vset, qdict = runCH()
+    for i in No
+        for j in No
+            for k in K
+                for t in T
+                    for p in P
+                        set_start_value(m[:V][i,j,k,t,p], ((i,j,k,t,p) in vset) ? 1 : 0)
+                    end
+                end
+            end
+        end
+    end
+
+    elapsedtime = @elapsed optimize!(m)
+    println("\n", nK, " ", total_demand, " ", objective_bound(m), " ", objective_value(m), " ", elapsedtime)
+    return has_values(m)
+end
+
+function runCH()
+    #global nK
+
+    demandhc, supplyhc = copy(demand), copy(supply)
+    routesch, demandhc, rent, fuel, eqpenalty, vset, qdict, loads = createSolution("onlybig", 1, nT, demandhc, supplyhc)
+    transportationcosts = sum(values(rent)) + sum(values(fuel))
+    unsatisfiedpenalty = sum(priorityo[c] * demandhc[c,j,t] for c in C for j in DP for t in T)
+    incumbentch = unsatisfiedpenalty + transportationcosts + (EQCONSTR ? wfairness*eqpenalty : 0)
+
+    #= reduce K set, removing unused vehicles
+    unusedK = []
+    for k in K
+        used = false
+        for t in T
+            if ("theta",o,k,t,1) in vset
+                used = true
+                break
+            end
+        end
+        if !used
+            push!(unusedK, k)
+            nK -= 1
+        end
+    end
+    setdiff!(K, unusedK)
+=#
+    if DEBUG
+        println(nK, " used vehicles: ", K)
+        printRouting(C, No, K, T, P, vset, qdict, vload, vmodel, nothing, "CH", incumbentch, unsatisfiedpenalty)
+    end
+
+    return routesch, incumbentch, unsatisfiedpenalty, transportationcosts, eqpenalty, vset, qdict
+end
+
+function runPS(vset, qdict, incumbent, method)
+    if incumbent > 0
+        loads = Dict()
+        pselapsedtime = @elapsed psfototal, psunsatisfied, pstransportation, pseq, inuse, unsatisfiedDemand, loads, qdict =
+            proximitySearch(vset, incumbent, RERUN_LS ? B : 1)
+
+        if DEBUG && psfototal > 1
+            printRouting(C, No, K, T, P, vset, qdict, vload, vmodel, nothing, method, psfototal, psunsatisfied)
+        end
+        GC.gc()
+        sleep(SLEEP)
+        GC.gc()
+        return psfototal, psunsatisfied, pstransportation, pseq
+    end
+    return -1*ones(4)
+end
+
+function runGRASP()
+    routesch, incumbentch, vset, qdict = runCH()
+    elapsedtime = @elapsed bestincumbent, bestunsatisfied, besttransportation, besteq, bestit, besttime, bestvset, bestqdict = gmain(incumbentch)
+    if RUN_LS
+        pselapsedtime = @elapsed psincumbent, psunsatisfied, pstransportation, pseq = runPS(bestvset, bestqdict, bestincumbent, "PS GRASP")
+        if psincumbent < 1
+            psincumbent, psunsatisfied, pstransportation, pseq = bestincumbent, bestunsatisfied, besttransportation, besteq
+        end
+        println(bestincumbent, " ", bestunsatisfied, " ", besttransportation, " ", besteq, " ",
+            psincumbent, " ", psunsatisfied, " ", pstransportation, " ", pseq, " ", bestit, " ", besttime, " ", elapsedtime, " ", pselapsedtime)
+    else
+        println(bestincumbent, " ", bestunsatisfied, " ", bestit, " ", besttime, " ", elapsedtime)
+    end
+end
+
+function main()
+    chelapsedtime = @elapsed routesch, incumbentch, unsatisfiedch, transportationch, eqch, vset, qdict = runCH()
+    pschelapsedtime = @elapsed psch, psunsatisfiedch, pstransportationch, pseqch =
+        RUN_LS ? runPS(vset, qdict, incumbentch, "PS CH") : (incumbentch, unsatisfiedch, transportationch, eqch)
+    if psch < 1
+        psch, psunsatisfiedch, pstransportationch, pseqch = incumbentch, unsatisfiedch, transportationch, eqch
+    end
+
+    routespetal = Dict()
+    #=petalonlyelapsedtime = @elapsed incumbentpetal, unsatisfiedpetalonly, transportationpetalonly, eqpetalonly,
+        vset, qdict, loads = runPetal(routespetal, "Petal only")
+    pspetalonlyelapsedtime = @elapsed pspetalonly, psunsatisfiedpetalonly, pstransportationpetalonly, pseqpetalonly =
+        false ? runPS(vset, qdict, incumbentpetal, "PS Petal only") : (incumbentpetal, unsatisfiedpetalonly, transportationpetalonly, eqpetalonly)
+    if pspetalonly < 1
+        pspetalonly, psunsatisfiedpetalonly, pstransportationpetalonly, pseqpetalonly = incumbentpetal, unsatisfiedpetalonly, transportationpetalonly, eqpetalonly
+    end=#
+
+    if FIRSTCHOICE == BYPRIORITY
+    petalelapsedtime = @elapsed incumbent, unsatisfiedpetal, transportationpetal, eqpetal,
+        vset, qdict, loads = runPetal(routespetal, "Petal", routesch)
+    pspetalelapsedtime = @elapsed pspetal, psunsatisfiedpetal, pstransportationpetal, pseqpetal =
+        RUN_LS ? runPS(vset, qdict, incumbent, "PS Petal") : (incumbent, unsatisfiedpetal, transportationpetal, eqpetal)
+    if pspetal < 1
+        pspetal, psunsatisfiedpetal, pstransportationpetal, pseqpetal = incumbent, unsatisfiedpetal, transportationpetal, eqpetal
+    end
+    end
+
+    #petalelapsedtime1 = @elapsed incumbent1, unsatisfiedpetal1, transportationpetal1, eqpetal1,
+    #    vset, qdict, loads = runPetal(routespetal, "Petal", routesch, 2)
+
+    #println("\n", instance, " ", nK, " ", incumbentch, " ", unsatisfiedch, " ", transportationch, " ", eqch)
+    print("\n", instance, " ", nK, " ", #sum(length(r) for r in values(routesch)), " ", minimum(length(routespetal[t]) for t in T), " ", maximum(length(routespetal[t]) for t in T, " "),
+        incumbentch, " ", unsatisfiedch, " ", transportationch, " ", eqch, " ")
+	#incumbentpetal, " ", unsatisfiedpetalonly, " ", transportationpetalonly, " ", eqpetalonly, " ",
+    if FIRSTCHOICE == BYPRIORITY
+        print(incumbent, " ", unsatisfiedpetal, " ", transportationpetal, " ", eqpetal, " ",
+        #incumbent1, " ", unsatisfiedpetal1, " ", transportationpetal1, " ", eqpetal1, " ",
+        #psch, " ", psunsatisfiedch, " ", pstransportationch, " ", pseqch, " ",
+        #pspetalonly, " ", psunsatisfiedpetalonly, " ", pstransportationpetalonly, " ", pseqpetalonly, " ",
+        #pspetal, " ", psunsatisfiedpetal, " ", pstransportationpetal, " ", pseqpetal, " ",
+        chelapsedtime, " ", petalelapsedtime) end
+    println()
+end
 
 if METHOD == EXACT
-    tstart = time()
-    vset, qdict = Set(), Dict()
-    unsatisfiedDemand = Dict()
-    for c in C
-        for j in DP
-            for t in T
-                unsatisfiedDemand[c,j,t] = 0
-            end
-        end
-    end
-    m = createModel(C, DP, N, K, 1, nT, supply, demand, TIME_LIMIT)
-    #=fo, rent, fuel, eq, eqmax, gap = solveModel(m, C, DP, N, K, T, 0, vset, qdict, unsatisfiedDemand)
-    elapsedtime = time()-tstart
-    if rent > 0
-        printRouting(C, No, K, T, P, vset, qdict, vload, vmodel, unsatisfiedDemand, TIME_LIMIT)
-    end
-    println(nK, " ", total_demand, " ", fo, " ", sum(priority[c] * unsatisfiedDemand[c,j,t] for c in C for j in DP for t in Tend[c]), " ", rent, " ", fuel, " ", eq, " ", eqmax, " ", elapsedtime, " ", termination_status(m))=#
+    runCplex()
+elseif METHOD == GRASP
+    runGRASP()
 else
-    if KNOWFUTURE
-        for t in 2:nT-2
-            getDataUpdate(t, 0)
-        end
-    end
-
-    methods = ["onlybig"] # "notrip", "1:nK", "nK:1", "onlybig", "onlysmall", "both"
-    besthc, bestps = "", ""
-    fohc, fops, minK = B, B, B
-
-    for im in 1:length(methods)
-        demandhc = copy(demand)
-        supplyhc = copy(supply)
-        demandhc, loads, rent, fuel, hceqsum[im], hceqmean[im], hceqmax[im], vset, qdict, hcelapsedtime[im] = createSolution(methods[im], 1, nT, demandhc, supplyhc)
-        hcfo[im] = sum(priority[c] * demandhc[c,j,t] for c in C for j in DP for t in T)
-        hcrent[im] = sum(values(rent))
-        hcfuel[im] = sum(values(fuel))
-        aux = hcfo[im] + hcrent[im] + hcfuel[im] + wfairness*hceqsum[im]
-        if aux < fohc
-            global besthc = methods[im]
-            global fohc = aux
-        end
-
-        if DEBUG
-            printRouting(C, No, K, T, P, vset, qdict, vload, vmodel, demandhc, hcelapsedtime[im])
-        end
-
-        if METHOD == PS
-            supplyps = copy(supply)
-            demandps, rentps, fuelps, pseqsum[im], pseqmean[im], pseqmax[im], pselapsedtime[im], vset, qdict, loads, nK2[im] = proximitySearch(3, nT, supplyps, demandhc, loads, rent, fuel, vset, qdict)
-            GC.gc()
-    	    sleep(SLEEP)
-            linfo[im], lineqsum[im], qdictlin = linearEq(loads, vset, qdict, psfo[im], 0, 0)
-
-            psfo[im] = sum(priority[c] * demandps[c,j,t] for c in C for j in DP for t in T)
-            psrent[im] = sum(values(rentps))
-            psfuel[im] = sum(values(fuelps))
-            aux = psfo[im] + psrent[im] + psfuel[im] + wfairness*pseqsum[im]
-            if aux < fops
-                global bestps = methods[im]
-                global fops = aux
-            end
-
-            global minK = min(minK, nK2[im])
-
-            # withinBound[im] = proximitySearchB(vset, aux)
-        else
-            linfo[im], lineqsum[im], qdictlin = linearEq(loads, vset, qdict, hcfo[im], 0, 0)
-        end
-
-        GC.gc()
-	    sleep(SLEEP)
-    end
-
-    for im in 1:length(methods)
-        print("\n", methods[im], " ", hcrent[im], " ", hcfuel[im], " ", hcfo[im], " ", hceqsum[im], " ", hceqmean[im], " ", hceqmax[im], " ", hcelapsedtime[im])
-        if METHOD == PS print(" ", psrent[im], " ", psfuel[im], " ", psfo[im], " ", pseqsum[im], " ", pseqmean[im], " ", pseqmax[im], " ", pselapsedtime[im], " ", withinBound[im]) end
-        print(" ", linfo[im], " ", lineqsum[im])
-    end
-    println("\n", nK, " ", minK, " ", total_demand, " ", fohc, " ", fops, " ", besthc, " ", bestps)
+    main()
 end
